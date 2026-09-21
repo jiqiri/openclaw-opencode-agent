@@ -420,6 +420,8 @@ async function raceBridgeTurn(sessionId, sentAt, validNames, modelId) {
   let firstCaptureAt = 0;
   let sawUnavail = false;
   let lastDropped = 0;
+  let lastCaptureCount = 0;
+  let quietPolls = 0;
   const checkText = (t, r) => { if (!sawUnavail && scanUnavail(t, r)) { sawUnavail = true; log('warn', `${tag} availability-check=MISSING (unavail signal in model output)`); } };
   try {
     while (Date.now() < deadline) {
@@ -431,9 +433,16 @@ async function raceBridgeTurn(sessionId, sentAt, validNames, modelId) {
         if (lastDropped > 0) log('warn', `${tag} case=C dropped ${lastDropped} capture(s) with unknown tool name`);
       }
       if (captures.length > 0) {
-        log('info', `${tag} availability-check=ATTACHED (${captures.length} capture(s))`);
-        if (!firstCaptureAt) firstCaptureAt = Date.now();
-        if (Date.now() - firstCaptureAt < CONFIG.bridgeBatchMs) continue;
+        if (!firstCaptureAt) {
+          firstCaptureAt = Date.now();
+          log('info', `${tag} availability-check=ATTACHED (${captures.length} capture(s))`);
+        }
+        // Early exit: no NEW captures for 3 straight polls and ≥3s elapsed —
+        // batch is complete, don't burn the full grace window.
+        if (captures.length > lastCaptureCount) { lastCaptureCount = captures.length; quietPolls = 0; }
+        else quietPolls++;
+        if (Date.now() - firstCaptureAt < CONFIG.bridgeBatchMs &&
+            !(quietPolls >= 3 && Date.now() - firstCaptureAt >= 3000)) continue;
         await interruptSession(sessionId);
         const toolCalls = captures.map((c, i) => ({
           id: `call_${Date.now().toString(36)}${i}`,

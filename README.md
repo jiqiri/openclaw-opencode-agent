@@ -200,7 +200,8 @@ systemctl --user restart opencode.service   # picks up the MCP server
 Env flags: `BRIDGE_ENABLED` (default `true`; `false` = pure v4.0 text),
 `BRIDGE_DIR` (capture dir, default `~/.openclaw/bridge-calls`),
 `BRIDGE_BATCH_MS` (default `12000` — grace window after the first capture so
-parallel batch mates land in the same `tool_calls` response).
+parallel batch mates land in the same `tool_calls` response; exits early
+after 3 quiet polls ≥3s, so single calls don't wait out the window).
 `tool_choice: "none"` also bypasses the bridge per request.
 
 Limits: tool *selection* relies on the model reading the injected catalog
