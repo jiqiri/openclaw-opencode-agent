@@ -1,0 +1,14 @@
+[Unit]
+Description=ocbridge MCP (remote HTTP, port 8899)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=BRIDGE_PORT=8899
+Environment=BRIDGE_DIR=%h/.openclaw/bridge-calls
+ExecStart=/usr/bin/node %h/.openclaw/ocbridge-http.cjs
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

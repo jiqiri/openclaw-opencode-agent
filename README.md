@@ -167,10 +167,14 @@ OpenClaw harness --tools--> proxy --prompt + tool catalog--> opencode loop
 
 How it works:
 
-1. A static MCP server (`bridge/ocbridge.cjs`) exposes exactly ONE tool,
-   `oc_call {tool, arguments}`. It never executes anything — it records the
-   call under `~/.openclaw/bridge-calls/<sessionId>.jsonl` and returns a
-   stop sentinel.
+1. A bridge MCP server exposes exactly ONE tool,
+   `oc_call {tool, arguments}`. Run the **remote** variant
+   (`bridge/ocbridge-http.cjs` + `systemd/ocbridge-mcp.service`, `:8899`):
+   opencode connects per call, so no persistent child can wedge
+   (the legacy stdio `bridge/ocbridge.cjs` worked but its child died
+   silently and was never respawned). The server never executes anything —
+   it records the call under `~/.openclaw/bridge-calls/<sessionId>.jsonl`
+   and returns a stop sentinel.
 2. On any chat request containing `tools`, the proxy spawns a throwaway
    session, injects the caller's function schemas as `<openclaw_tools>` JSON
    plus a strict call-only-that-tool protocol, and polls the capture files.
@@ -182,10 +186,14 @@ How it works:
 Setup (one-time, on top of the proxy install):
 
 ```bash
-cp bridge/ocbridge.cjs ~/.openclaw/
+# Remote bridge (recommended): supervised HTTP server, no wedging child.
+cp bridge/ocbridge-http.cjs ~/.openclaw/
+cp systemd/ocbridge-mcp.service ~/.config/systemd/user/
 mkdir -p ~/.openclaw/bridge-calls
 # merge bridge/opencode-mcp-snippet.jsonc into ~/.config/opencode/opencode.jsonc
 # under mcp.servers, then:
+systemctl --user daemon-reload
+systemctl --user enable --now ocbridge-mcp.service
 systemctl --user restart opencode.service   # picks up the MCP server
 ```
 
@@ -199,8 +207,19 @@ Limits: tool *selection* relies on the model reading the injected catalog
 (verified working on big-pickle/mimo-v2.5-free, incl. parallel calls);
 each bridge turn costs one extra loop pass; independent calls in one turn are
 batched into a single `tool_calls` response (native-style parallel calls),
-unknown tool names are dropped with a warning; bridge sessions are deleted after
-every turn (no cross-talk, no leaks).
+unknown tool names are dropped with a warning; bridge sessions persist per
+(auth, model) up to `BRIDGE_MAX_TURNS` (default 40) so multi-turn work keeps
+memory, with the catalog injected once (a shrinking history resets the
+session as a new conversation).
+
+Reliability notes (opencode v2.0.11 build):
+- The bridge depends on opencode attaching the ocbridge MCP per session.
+  If turns start falling back to text with "tool not available" reasoning,
+  refresh with `systemctl --user restart opencode.service` (proxy sessions
+  rebuild on demand; in-flight turns may need one retry). Never restart
+  `ocbridge-mcp.service` while serve is up without restarting serve after.
+- Prefer the remote HTTP bridge (`bridge/ocbridge-http.cjs` + unit): the
+  legacy stdio child's process can die silently and is never respawned.
 
 ## Verify
 

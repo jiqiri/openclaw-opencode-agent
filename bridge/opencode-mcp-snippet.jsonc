@@ -1,15 +1,21 @@
 // Merge into ~/.config/opencode/opencode.jsonc, then:
-//   systemctl --user restart opense... (opencode.service)
-// The bridge MCP exposes ONE tool (oc_call). The proxy (v4.1+) injects the
-// caller's function schemas per request and translates captures back into
-// OpenAI tool_calls. The server never executes anything itself.
+//   systemctl --user restart opencode.service
+//
+// Use the REMOTE variant (recommended): opencode connects per call, so there
+// is no persistent child process that can wedge. Requires ocbridge-mcp.service
+// running (repo: systemd/ocbridge-mcp.service, server: bridge/ocbridge-http.cjs).
 {
   "mcp": {
     "servers": {
       "ocbridge": {
-        "type": "local",
-        "command": ["node", "/home/info/.openclaw/ocbridge.cjs"]
+        "type": "remote",
+        "url": "http://127.0.0.1:8899/mcp",
+        "enabled": true
       }
     }
   }
 }
+
+// Legacy alternative (stdio): "command": ["node", "/home/info/.openclaw/ocbridge.cjs"]
+// with "type": "local". Works but the child process can die silently and is
+// never respawned (bridge/ocbridge.cjs). Prefer remote.

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// OpenCode SDK Proxy — v4.0 (opencode serve v2 API)
+// OpenCode SDK Proxy — v4.2 (opencode serve v2 API)
 // Talks to `opencode serve` v2.x HTTP API with pure fetch (no @opencode-ai/sdk,
 // whose 1.x client targets the old /message sync API).
 //
@@ -43,6 +43,9 @@ const CONFIG = {
   // After the first capture, keep the loop alive this long to collect
   // parallel batch mates before interrupting (native parity: N calls/turn).
   bridgeBatchMs: parseInt(process.env.BRIDGE_BATCH_MS || '12000', 10),
+  // v4.2: reuse one bridge session per (auth,model) so the loop keeps memory
+  // across turns (no more lost-results/redo). Reset after this many turns.
+  bridgeMaxTurns: parseInt(process.env.BRIDGE_MAX_TURNS || '40', 10),
 };
 
 const SDK_PASSWORD = process.env.OPENCODE_SERVER_PASSWORD;
@@ -303,8 +306,16 @@ async function interruptSession(sessionId) {
   } catch {}
 }
 
-async function sendPromptWithTools(authKey, modelId, variant, text, files, systemPrompt, tools) {
-  // Fresh throwaway session per tool turn (never reuse: avoids cross-talk).
+// v4.2: persistent bridge sessions. The loop keeps memory across turns, so
+// follow-ups send ONLY new messages (catalog + protocol injected once at
+// creation). Reset when the client history shrinks (new conversation),
+// on error, or after BRIDGE_MAX_TURNS.
+const bridgeSessions = new Map(); // sKey -> { sessionId, sentCount, turns }
+
+async function getOrCreateBridgeSession(authKey, modelId, variant) {
+  const sKey = sessionKey(authKey, modelId, variant);
+  const cached = bridgeSessions.get(sKey);
+  if (cached) return { ...cached, sKey, isNew: false };
   const modelRef = { providerID: 'opencode', id: modelId };
   if (variant) modelRef.variant = variant;
   const created = await sdkPost('/api/session', {
@@ -313,15 +324,58 @@ async function sendPromptWithTools(authKey, modelId, variant, text, files, syste
   });
   const sessionId = created?.data?.id;
   if (!sessionId) throw new Error('Failed to create bridge session');
-  log('info', `Bridge session: ${sessionId} for ${modelId}`);
-  try {
-    clearCaptures(sessionId);
-    const protocol = buildBridgeProtocol(tools);
-    const fullText = [systemPrompt, protocol, text].filter(Boolean).join('\n\n');
-    const body = { text: fullText };
-    if (files.length > 0) body.files = files;
-    const sentAt = Date.now();
-    await sdkPost(`/api/session/${sessionId}/prompt`, body, 30000);
+  const entry = { sessionId, sKey, sentCount: 0, turns: 0, isNew: true };
+  bridgeSessions.set(sKey, entry);
+  log('info', `New bridge session: ${sessionId} for ${modelId}`);
+  return entry;
+}
+
+function dropBridgeSession(sKey) {
+  const e = bridgeSessions.get(sKey);
+  bridgeSessions.delete(sKey);
+  if (e) { clearCaptures(e.sessionId); deleteSession(e.sessionId); }
+}
+
+async function sendPromptWithTools(authKey, modelId, variant, messages, files, systemPrompt, tools) {
+  const maxRetries = 2;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    let entry = await getOrCreateBridgeSession(authKey, modelId, variant);
+    let { sessionId, sKey } = entry;
+    try {
+      await ensureModel(sessionId, modelId, variant);
+
+      // New conversation on a reused key? History did not grow (same length
+      // = retry/duplicate, shorter = new chat) -> reset to a fresh session.
+      // Only a strictly longer history is a true continuation.
+      if (!entry.isNew && messages.length <= entry.sentCount) {
+        log('info', 'Bridge history did not grow, resetting session (new conversation)');
+        dropBridgeSession(sKey);
+        entry = await getOrCreateBridgeSession(authKey, modelId, variant);
+        sessionId = entry.sessionId;
+      }
+
+      // Incremental forward: only messages the loop hasn't seen yet.
+      const fresh = messages.slice(entry.sentCount);
+      const convText = renderConversation(fresh.length > 0 ? fresh : messages);
+      const isFirstTurn = entry.sentCount === 0;
+      // Catalog + protocol injected once (creation turn); later turns rely
+      // on loop memory. System prompt likewise (avoids duplication noise).
+      const fullText = isFirstTurn
+        ? [systemPrompt, buildBridgeProtocol(tools), convText].filter(Boolean).join('\n\n')
+        : convText;
+      const body = { text: fullText };
+      if (files.length > 0) body.files = files;
+      const sentAt = Date.now();
+      clearCaptures(sessionId); // stale captures from a prior turn must not retrigger
+      await sdkPost(`/api/session/${entry.sessionId}/prompt`, body, 30000);
+      entry.sentCount = messages.length;
+      entry.turns += 1;
+      if (entry.turns >= CONFIG.bridgeMaxTurns) {
+        log('info', `Bridge session hit ${entry.turns} turns, will reset next turn`);
+        dropBridgeSession(sKey);
+      } else {
+        bridgeSessions.set(sKey, entry);
+      }
 
     // Race: captures (tool calls) vs fresh assistant text (direct answer).
     // Poll in slices so text answers return fast instead of waiting out
@@ -368,7 +422,10 @@ async function sendPromptWithTools(authKey, modelId, variant, text, files, syste
             (m?.content || []).some((c) => c.type === 'text' && c.text));
           if (fresh) {
             const out = extractAssistant([fresh]);
-            if (out?.textContent) return { textResult: out };
+            if (out?.textContent) {
+              await interruptSession(sessionId); // stop background loop before reuse
+              return { textResult: out };
+            }
           }
         } catch {}
       }
@@ -382,10 +439,15 @@ async function sendPromptWithTools(authKey, modelId, variant, text, files, syste
     const listed = await sdkGet(`/api/session/${sessionId}/message?order=asc&limit=100`);
     const result = extractAssistant(listed?.data);
     return { textResult: result };
-  } finally {
-    clearCaptures(sessionId);
-    await deleteSession(sessionId);
-    sessions.delete(sessionKey(authKey, modelId, variant));
+    } catch (err) {
+      dropBridgeSession(sKey); // poisoned session must not be reused
+      if (err.message.includes('timed out')) throw err;
+      if (attempt < maxRetries - 1) {
+        log('warn', `Bridge turn failed (attempt ${attempt + 1}), retrying fresh: ${err.message}`);
+        continue;
+      }
+      throw err;
+    }
   }
 }
 
@@ -648,7 +710,7 @@ const server = http.createServer(async (req, res) => {
     } catch {}
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
-      status: 'ok', version: '4.1', proxy: 'running',
+      status: 'ok', version: '4.2', proxy: 'running',
       sdk: sdkStatus, uptime: process.uptime(), sessions: sessions.size,
       autoApprove: CONFIG.autoApprovePermissions,
       reasoningFormat: CONFIG.reasoningFormat,
@@ -704,8 +766,7 @@ const server = http.createServer(async (req, res) => {
         const authKey = req.headers.authorization || 'default';
 
         if (useBridge) {
-          const convText = renderConversation(messages);
-          const result = await sendPromptWithTools(authKey, modelId, variant, convText, files, fullSystem, tools);
+          const result = await sendPromptWithTools(authKey, modelId, variant, messages, files, fullSystem, tools);
           if (result.toolCalls) {
             log('info', `Bridge: ${result.toolCalls.length} tool call(s): ${result.toolCalls.map((t) => t.function.name).join(', ')}`);
             if (isStreaming) {
@@ -756,7 +817,7 @@ const server = http.createServer(async (req, res) => {
 
 // ─── Start ──────────────────────────────────────────────────────────────────
 server.listen(CONFIG.port, CONFIG.bindHost, () => {
-  log('info', `Proxy v4.1 running on http://${CONFIG.bindHost}:${CONFIG.port}`);
+  log('info', `Proxy v4.2 running on http://${CONFIG.bindHost}:${CONFIG.port}`);
   log('info', `SDK: ${CONFIG.sdkUrl} | Timeout: ${CONFIG.requestTimeoutMs}ms`);
   log('info', `Auto-approve: ${CONFIG.autoApprovePermissions} | Reasoning: ${CONFIG.reasoningFormat}`);
 });
