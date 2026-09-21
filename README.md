@@ -221,6 +221,29 @@ Reliability notes (opencode v2.0.11 build):
 - Prefer the remote HTTP bridge (`bridge/ocbridge-http.cjs` + unit): the
   legacy stdio child's process can die silently and is never respawned.
 
+### v4.3 automatic recovery (no restart needed in most cases)
+
+When a turn reports missing tools, the proxy classifies and recovers without
+touching the UI response path:
+
+| Case | Meaning | Action |
+|------|---------|--------|
+| A | Bridge server itself down (`tools/list` fails) | Keep session, text fallback. No churn. |
+| B | Bridge healthy, session lost MCP attach | Drop stale session → fresh session → retry **only the current call** (system + catalog once, current-turn messages, no replay of completed calls) |
+| C | Unknown tool name in a capture | Drop that capture with a warning, keep waiting |
+| D | Session dead (prompt/switch errors) | Drop + fresh retry via existing `maxRetries` |
+
+Detection is reactive (no serve API exposes per-session attachment): the
+proxy scans fresh assistant text/reasoning for attach-loss phrasing, checks
+bridge health, then recovers. Every step logs structured lines
+(`Bridge [sid model] check/recycle/reattach/retry/fallback`). If recovery
+fails, the existing text fallback answers — HTTP is always 200.
+
+Regression: `node test-bridge-v43.mjs` — chain A→B→text, forced-B recovery,
+bridge-down case A, long img→article→publish→text chain; asserts session
+reuse (1 bridge session), single catalog injection, no repeated actions,
+no hard-fails. Needs the live stack (proxy + serve + bridge).
+
 ## Verify
 
 ```bash
@@ -287,8 +310,10 @@ listing the valid ones.
 
 | File | Description |
 |------|-------------|
-| `opencode-proxy.js` | Proxy v4.1 (OpenAI API → `opencode serve` v2 API + tool bridge) |
-| `bridge/ocbridge.cjs` | Static MCP bridge server (single `oc_call` capture tool; copy to `~/.openclaw/`) |
+| `opencode-proxy.js` | Proxy v4.3 (OpenAI API → `opencode serve` v2 API + tool bridge + auto-recovery) |
+| `bridge/ocbridge-http.cjs` | Remote MCP bridge server (single `oc_call` capture tool; supervised by `systemd/ocbridge-mcp.service`) |
+| `bridge/ocbridge.cjs` | Legacy stdio variant (kept for reference; prefer remote) |
+| `test-bridge-v43.mjs` | Regression suite: chains, forced-B recovery, bridge-down case A (`node test-bridge-v43.mjs`) |
 | `bridge/opencode-mcp-snippet.jsonc` | MCP registration snippet (merge into opencode config, restart serve) |
 | `start-openclaw.sh` | Starts server + proxy with shared password file (manual/shell use) |
 | `stop-openclaw.sh` | Stops server + proxy (manual/shell use) |

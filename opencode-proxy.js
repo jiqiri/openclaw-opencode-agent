@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// OpenCode SDK Proxy — v4.2 (opencode serve v2 API)
+// OpenCode SDK Proxy — v4.3 (opencode serve v2 API)
 // Talks to `opencode serve` v2.x HTTP API with pure fetch (no @opencode-ai/sdk,
 // whose 1.x client targets the old /message sync API).
 //
@@ -46,6 +46,15 @@ const CONFIG = {
   // v4.2: reuse one bridge session per (auth,model) so the loop keeps memory
   // across turns (no more lost-results/redo). Reset after this many turns.
   bridgeMaxTurns: parseInt(process.env.BRIDGE_MAX_TURNS || '40', 10),
+  // v4.3: bridge health + unavailability classifier. No serve API exposes
+  // per-session tool attachment, so detection is reactive: scan the fresh
+  // assistant text/reasoning produced during the turn for attach-loss signals.
+  bridgeHealthUrl: process.env.BRIDGE_HEALTH_URL || 'http://127.0.0.1:8899/mcp',
+  // v4.3: helper retained for manual/opt-in use, but the recovery flow does
+  // NOT bounce the bridge automatically: restarting it severs opencode's
+  // live MCP connections and the client does not reconnect cleanly
+  // (observed death spiral). Default OFF; serve restart is the refresh lever.
+  bridgeRestartUnit: process.env.BRIDGE_RESTART_UNIT || '',
 };
 
 const SDK_PASSWORD = process.env.OPENCODE_SERVER_PASSWORD;
@@ -336,6 +345,171 @@ function dropBridgeSession(sKey) {
   if (e) { clearCaptures(e.sessionId); deleteSession(e.sessionId); }
 }
 
+// v4.3: bounce the bridge unit so opencode's MCP client reconnects clean.
+// Returns true when the unit is active again afterwards.
+import { execFile as _execFile } from 'child_process';
+function execFileAsync(cmd, args, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    _execFile(cmd, args, { timeout: timeoutMs }, (err, stdout, stderr) => {
+      if (err) reject(new Error(`${cmd} ${args.join(' ')}: ${err.message}`));
+      else resolve(stdout);
+    });
+  });
+}
+async function restartBridgeUnit(reason) {
+  const unit = CONFIG.bridgeRestartUnit;
+  if (!unit) { log('warn', `Bridge restart skipped (BRIDGE_RESTART_UNIT empty), reason=${reason}`); return false; }
+  try {
+    log('warn', `Bridge bounce unit=${unit} reason=${reason}`);
+    await execFileAsync('systemctl', ['--user', 'restart', unit]);
+    await new Promise((r) => setTimeout(r, 3000));
+    const st = (await execFileAsync('systemctl', ['--user', 'is-active', unit])).trim();
+    log('info', `Bridge bounce unit=${unit} state=${st}`);
+    return st === 'active';
+  } catch (e) {
+    log('warn', `Bridge bounce unit=${unit} FAILED: ${e.message}`);
+    return false;
+  }
+}
+
+// v4.3: case split for bridge health. A=bridge down, B+=bridge up (per-turn
+// evidence decides B vs normal-text inside the race).
+async function checkBridgeHealth() {
+  const started = Date.now();
+  try {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 8000);
+    const resp = await fetch(CONFIG.bridgeHealthUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 'health', method: 'tools/list', params: {} }),
+      signal: controller.signal,
+    });
+    clearTimeout(t);
+    if (!resp.ok) return { ok: false, ms: Date.now() - started, detail: `http ${resp.status}` };
+    const data = await resp.json().catch(() => null);
+    const tools = data?.result?.tools;
+    if (!Array.isArray(tools) || !tools.some((x) => x?.name === 'oc_call')) {
+      return { ok: false, ms: Date.now() - started, detail: 'oc_call missing from tools/list' };
+    }
+    return { ok: true, ms: Date.now() - started, detail: 'oc_call listed' };
+  } catch (e) {
+    return { ok: false, ms: Date.now() - started, detail: e.message };
+  }
+}
+
+// v4.3: attach-loss signal. Matches model wording observed when opencode's
+// MCP client has the tool cataloged but execution fails ("No tool named
+// 'tools.ocbridge.oc_call' ... not available ...").
+const UNAVAIL_RE = /not available|isn'?t available|unavailable|cannot (see|find|access|use|call).{0,60}tool|no .*tool (named|called)|tool .* (missing|unavailable)|doesn'?t (have|show|list).{0,40}tool/i;
+
+function scanUnavail(text, reasoning) {
+  const hay = `${text || ''}\n${reasoning || ''}`;
+  return UNAVAIL_RE.test(hay);
+}
+
+// v4.3: one turn race. Returns { toolCalls } on capture, else
+// { textResult, sawUnavail } where sawUnavail flags attach-loss evidence.
+async function raceBridgeTurn(sessionId, sentAt, validNames, modelId) {
+  const tag = `Bridge [sid=${sessionId} model=${modelId}]`;
+  const poller = setInterval(() => {
+    autoReplyPermissions(sessionId).catch(() => {});
+    autoReplyForms(sessionId).catch(() => {});
+  }, CONFIG.pollIntervalMs);
+  const deadline = Date.now() + CONFIG.requestTimeoutMs;
+  let firstCaptureAt = 0;
+  let sawUnavail = false;
+  let lastDropped = 0;
+  const checkText = (t, r) => { if (!sawUnavail && scanUnavail(t, r)) { sawUnavail = true; log('warn', `${tag} availability-check=MISSING (unavail signal in model output)`); } };
+  try {
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, CONFIG.pollIntervalMs));
+      const all = readCaptures(sessionId);
+      const captures = all.filter((c) => validNames.has(String(c.arguments?.tool || '')));
+      if (all.length - captures.length !== lastDropped) {
+        lastDropped = all.length - captures.length;
+        if (lastDropped > 0) log('warn', `${tag} case=C dropped ${lastDropped} capture(s) with unknown tool name`);
+      }
+      if (captures.length > 0) {
+        log('info', `${tag} availability-check=ATTACHED (${captures.length} capture(s))`);
+        if (!firstCaptureAt) firstCaptureAt = Date.now();
+        if (Date.now() - firstCaptureAt < CONFIG.bridgeBatchMs) continue;
+        await interruptSession(sessionId);
+        const toolCalls = captures.map((c, i) => ({
+          id: `call_${Date.now().toString(36)}${i}`,
+          type: 'function',
+          function: {
+            name: String(c.arguments?.tool || ''),
+            arguments: typeof c.arguments?.arguments === 'string'
+              ? c.arguments.arguments
+              : JSON.stringify(c.arguments?.arguments ?? {}),
+          },
+        })).filter((tc) => tc.function.name);
+        if (toolCalls.length > 0) return { toolCalls };
+      }
+      // Fresh assistant text after our prompt => direct answer, no tools.
+      try {
+        const listed = await sdkGet(`/api/session/${sessionId}/message?order=desc&limit=5`);
+        const fresh = (listed?.data || []).find((m) =>
+          m?.type === 'assistant' && (m?.time?.created || 0) >= sentAt &&
+          (m?.content || []).some((c) => c.type === 'text' && c.text));
+        if (fresh) {
+          const out = extractAssistant([fresh]);
+          if (out?.textContent) {
+            checkText(out.textContent, out.reasoningContent);
+            await interruptSession(sessionId); // stop background loop before reuse
+            return { textResult: out, sawUnavail };
+          }
+        }
+      } catch {}
+    }
+  } finally {
+    clearInterval(poller);
+  }
+  await interruptSession(sessionId);
+  // Fallback: no bridge call -> latest text from the session.
+  await waitForIdle(sessionId).catch(() => {});
+  const listed = await sdkGet(`/api/session/${sessionId}/message?order=asc&limit=100`);
+  const result = extractAssistant(listed?.data);
+  if (result) checkText(result.responseText, result.reasoningContent);
+  return { textResult: result, sawUnavail };
+}
+
+// v4.3: recovery retry for case B. Fresh session, system + catalog injected
+// ONCE (new session needs it), ONLY the current turn's messages (no replay of
+// completed calls/history). Single attempt, no nested recovery.
+async function bridgeRecoveryTurn(authKey, modelId, variant, retryMsgs, fullCount, files, systemPrompt, tools) {
+  let entry;
+  try {
+    entry = await getOrCreateBridgeSession(authKey, modelId, variant);
+  } catch (e) {
+    log('warn', `Bridge [model=${modelId}] recovery reattach FAILED at session create: ${e.message}`);
+    return null;
+  }
+  const { sessionId, sKey } = entry;
+  log('info', `Bridge [sid=${sessionId} model=${modelId}] reattach OK (fresh session), retry msgs=${retryMsgs.length} catalog=injected`);
+  try {
+    await ensureModel(sessionId, modelId, variant);
+    const convText = renderConversation(retryMsgs);
+    const fullText = [systemPrompt, buildBridgeProtocol(tools), convText].filter(Boolean).join('\n\n');
+    const body = { text: fullText };
+    if (files.length > 0) body.files = files;
+    const sentAt = Date.now();
+    clearCaptures(sessionId);
+    await sdkPost(`/api/session/${sessionId}/prompt`, body, 30000);
+    entry.sentCount = fullCount; // future turns continue incrementally off full history
+    entry.turns = 1;
+    bridgeSessions.set(sKey, entry);
+    const validNames = new Set(
+      (tools || []).filter((t) => t?.type === 'function' && t?.function?.name).map((t) => t.function.name));
+    return await raceBridgeTurn(sessionId, sentAt, validNames, modelId);
+  } catch (e) {
+    log('warn', `Bridge [sid=${sessionId} model=${modelId}] recovery retry FAILED: ${e.message}`);
+    dropBridgeSession(sKey);
+    return null;
+  }
+}
+
 async function sendPromptWithTools(authKey, modelId, variant, messages, files, systemPrompt, tools) {
   const maxRetries = 2;
   for (let attempt = 0; attempt < maxRetries; attempt++) {
@@ -356,13 +530,17 @@ async function sendPromptWithTools(authKey, modelId, variant, messages, files, s
 
       // Incremental forward: only messages the loop hasn't seen yet.
       const fresh = messages.slice(entry.sentCount);
-      const convText = renderConversation(fresh.length > 0 ? fresh : messages);
+      const retryMsgs = fresh.length > 0 ? fresh : messages; // current turn only (recovery-safe)
+      const convText = renderConversation(retryMsgs);
+      const validNames = new Set(
+        (tools || []).filter((t) => t?.type === 'function' && t?.function?.name).map((t) => t.function.name));
       const isFirstTurn = entry.sentCount === 0;
       // Catalog + protocol injected once (creation turn); later turns rely
       // on loop memory. System prompt likewise (avoids duplication noise).
       const fullText = isFirstTurn
         ? [systemPrompt, buildBridgeProtocol(tools), convText].filter(Boolean).join('\n\n')
         : convText;
+      if (isFirstTurn) log('info', `Bridge [sid=${sessionId} model=${modelId}] catalog=injected (first turn, msgs=${messages.length})`);
       const body = { text: fullText };
       if (files.length > 0) body.files = files;
       const sentAt = Date.now();
@@ -377,71 +555,39 @@ async function sendPromptWithTools(authKey, modelId, variant, messages, files, s
         bridgeSessions.set(sKey, entry);
       }
 
-    // Race: captures (tool calls) vs fresh assistant text (direct answer).
-    // Poll in slices so text answers return fast instead of waiting out
-    // the full timeout.
-    const poller = setInterval(() => {
-      autoReplyPermissions(sessionId).catch(() => {});
-      autoReplyForms(sessionId).catch(() => {});
-    }, CONFIG.pollIntervalMs);
-    const deadline = Date.now() + CONFIG.requestTimeoutMs;
-    // After the first capture, allow a grace window so parallel batch mates
-    // land in the SAME tool_calls response (native parity).
-    const validNames = new Set(
-      (tools || []).filter((t) => t?.type === 'function' && t?.function?.name).map((t) => t.function.name));
-    let firstCaptureAt = 0;
-    try {
-      while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, CONFIG.pollIntervalMs));
-        const all = readCaptures(sessionId);
-        const captures = all.filter((c) => validNames.has(String(c.arguments?.tool || '')));
-        if (all.length > captures.length) {
-          log('warn', `Bridge: dropped ${all.length - captures.length} capture(s) with unknown tool name`);
-        }
-        if (captures.length > 0) {
-          if (!firstCaptureAt) firstCaptureAt = Date.now();
-          if (Date.now() - firstCaptureAt < CONFIG.bridgeBatchMs) continue;
-          await interruptSession(sessionId);
-          const toolCalls = captures.map((c, i) => ({
-            id: `call_${Date.now().toString(36)}${i}`,
-            type: 'function',
-            function: {
-              name: String(c.arguments?.tool || ''),
-              arguments: typeof c.arguments?.arguments === 'string'
-                ? c.arguments.arguments
-                : JSON.stringify(c.arguments?.arguments ?? {}),
-            },
-          })).filter((tc) => tc.function.name);
-          if (toolCalls.length > 0) return { toolCalls };
-        }
-        // Fresh assistant text after our prompt => direct answer, no tools.
-        try {
-          const listed = await sdkGet(`/api/session/${sessionId}/message?order=desc&limit=5`);
-          const fresh = (listed?.data || []).find((m) =>
-            m?.type === 'assistant' && (m?.time?.created || 0) >= sentAt &&
-            (m?.content || []).some((c) => c.type === 'text' && c.text));
-          if (fresh) {
-            const out = extractAssistant([fresh]);
-            if (out?.textContent) {
-              await interruptSession(sessionId); // stop background loop before reuse
-              return { textResult: out };
-            }
-          }
-        } catch {}
-      }
-    } finally {
-      clearInterval(poller);
-    }
-    await interruptSession(sessionId);
+    // v4.3: race for captures vs direct text; the outcome carries an
+    // attach-loss flag so the orchestrator below can classify + recover.
+    const outcome = await raceBridgeTurn(sessionId, sentAt, validNames, modelId);
+    if (outcome.toolCalls) return outcome;
 
-    // Fallback: no bridge call -> return latest text from the session.
-    await waitForIdle(sessionId).catch(() => {});
-    const listed = await sdkGet(`/api/session/${sessionId}/message?order=asc&limit=100`);
-    const result = extractAssistant(listed?.data);
-    return { textResult: result };
+    // v4.3 classifier: text answer that reports missing tools?
+    if (!outcome.sawUnavail) return outcome; // normal text answer, no recovery
+    let health = await checkBridgeHealth();
+    log('info', `Bridge [sid=${sessionId} model=${modelId}] check health=${health.ok ? 'ok' : 'DOWN'} (${health.ms}ms ${health.detail}) tool=pending`);
+    if (!health.ok) {
+      // Case A: bridge itself unreachable. Do NOT bounce it here: restarting
+      // the bridge severs opencode's in-flight MCP connections and the client
+      // does not reconnect cleanly (serve restart required). Keep the session,
+      // fall back to text, and let the operator recycle serve when convenient.
+      log('warn', `Bridge [sid=${sessionId} model=${modelId}] case=A bridge-down, keep session, text fallback`);
+      return outcome; // graceful, no session churn
+    }
+    // Case B: bridge healthy but this session lost MCP attachment.
+    // Recycle ONLY the session (fresh handshake); never bounce the bridge
+    // unit mid-traffic — that severs all live MCP connections.
+    log('warn', `Bridge [sid=${sessionId} model=${modelId}] case=B attach-lost, recovery attempt: recycle session`);
+    dropBridgeSession(sKey);
+    const retried = await bridgeRecoveryTurn(authKey, modelId, variant, retryMsgs, messages.length, files, systemPrompt, tools);
+    if (retried?.toolCalls) {
+      log('info', `Bridge [model=${modelId}] recovery retry OK: ${retried.toolCalls.length} call(s)`);
+      return retried;
+    }
+    log('warn', `Bridge [model=${modelId}] recovery failed, text fallback (UI unaffected)`);
+    return (retried && retried.textResult) ? retried : outcome;
     } catch (err) {
       dropBridgeSession(sKey); // poisoned session must not be reused
       if (err.message.includes('timed out')) throw err;
+      log('warn', `Bridge [model=${modelId}] case=D session-dead turn failed (attempt ${attempt + 1}): ${err.message}`);
       if (attempt < maxRetries - 1) {
         log('warn', `Bridge turn failed (attempt ${attempt + 1}), retrying fresh: ${err.message}`);
         continue;
@@ -710,7 +856,7 @@ const server = http.createServer(async (req, res) => {
     } catch {}
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
-      status: 'ok', version: '4.2', proxy: 'running',
+      status: 'ok', version: '4.3', proxy: 'running',
       sdk: sdkStatus, uptime: process.uptime(), sessions: sessions.size,
       autoApprove: CONFIG.autoApprovePermissions,
       reasoningFormat: CONFIG.reasoningFormat,
@@ -817,7 +963,7 @@ const server = http.createServer(async (req, res) => {
 
 // ─── Start ──────────────────────────────────────────────────────────────────
 server.listen(CONFIG.port, CONFIG.bindHost, () => {
-  log('info', `Proxy v4.2 running on http://${CONFIG.bindHost}:${CONFIG.port}`);
+  log('info', `Proxy v4.3 running on http://${CONFIG.bindHost}:${CONFIG.port}`);
   log('info', `SDK: ${CONFIG.sdkUrl} | Timeout: ${CONFIG.requestTimeoutMs}ms`);
   log('info', `Auto-approve: ${CONFIG.autoApprovePermissions} | Reasoning: ${CONFIG.reasoningFormat}`);
 });
