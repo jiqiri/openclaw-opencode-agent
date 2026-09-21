@@ -190,12 +190,16 @@ systemctl --user restart opencode.service   # picks up the MCP server
 ```
 
 Env flags: `BRIDGE_ENABLED` (default `true`; `false` = pure v4.0 text),
-`BRIDGE_DIR` (capture dir, default `~/.openclaw/bridge-calls`).
+`BRIDGE_DIR` (capture dir, default `~/.openclaw/bridge-calls`),
+`BRIDGE_BATCH_MS` (default `12000` — grace window after the first capture so
+parallel batch mates land in the same `tool_calls` response).
 `tool_choice: "none"` also bypasses the bridge per request.
 
 Limits: tool *selection* relies on the model reading the injected catalog
 (verified working on big-pickle/mimo-v2.5-free, incl. parallel calls);
-each bridge turn costs one extra loop pass; bridge sessions are deleted after
+each bridge turn costs one extra loop pass; independent calls in one turn are
+batched into a single `tool_calls` response (native-style parallel calls),
+unknown tool names are dropped with a warning; bridge sessions are deleted after
 every turn (no cross-talk, no leaks).
 
 ## Verify

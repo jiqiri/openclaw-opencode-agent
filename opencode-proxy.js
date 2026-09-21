@@ -40,6 +40,9 @@ const CONFIG = {
   // Requires the ocbridge MCP server in opencode config (see README).
   bridgeEnabled: process.env.BRIDGE_ENABLED !== 'false',
   bridgeDir: process.env.BRIDGE_DIR || (process.env.HOME + '/.openclaw/bridge-calls'),
+  // After the first capture, keep the loop alive this long to collect
+  // parallel batch mates before interrupting (native parity: N calls/turn).
+  bridgeBatchMs: parseInt(process.env.BRIDGE_BATCH_MS || '12000', 10),
 };
 
 const SDK_PASSWORD = process.env.OPENCODE_SERVER_PASSWORD;
@@ -237,10 +240,11 @@ function buildBridgeProtocol(tools) {
 ${JSON.stringify(fns)}
 </openclaw_tools>
 PROTOCOL (follow exactly):
-1. If the user request needs an OpenClaw function, call oc_call with the exact "tool" name and "arguments" as a JSON string. You may call oc_call multiple times for parallel needs.
-2. Do NOT use any other tools (no file/shell/web tools) when an OpenClaw function applies.
-3. After calling oc_call, STOP. Do not write any text after the calls.
-4. If no OpenClaw function applies, answer with plain text and call nothing.`;
+1. If the user request needs OpenClaw functions, call oc_call with the exact "tool" name and "arguments" as a JSON string. Match "tool" character-for-character against <openclaw_tools> — never invent, rename, or substitute names.
+2. If several INDEPENDENT OpenClaw functions are needed, call oc_call once per function BACK-TO-BACK in the same turn before stopping (batch them like a native parallel tool call).
+3. Do NOT use any built-in tools (no file/shell/web tools) when an OpenClaw function applies — the caller executes OpenClaw functions itself.
+4. After calling oc_call, STOP. Do not write any text after the calls.
+5. If no OpenClaw function applies, answer with plain text and call nothing.`;
 }
 
 function renderConversation(messages) {
@@ -327,11 +331,22 @@ async function sendPromptWithTools(authKey, modelId, variant, text, files, syste
       autoReplyForms(sessionId).catch(() => {});
     }, CONFIG.pollIntervalMs);
     const deadline = Date.now() + CONFIG.requestTimeoutMs;
+    // After the first capture, allow a grace window so parallel batch mates
+    // land in the SAME tool_calls response (native parity).
+    const validNames = new Set(
+      (tools || []).filter((t) => t?.type === 'function' && t?.function?.name).map((t) => t.function.name));
+    let firstCaptureAt = 0;
     try {
       while (Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, CONFIG.pollIntervalMs));
-        const captures = readCaptures(sessionId);
+        const all = readCaptures(sessionId);
+        const captures = all.filter((c) => validNames.has(String(c.arguments?.tool || '')));
+        if (all.length > captures.length) {
+          log('warn', `Bridge: dropped ${all.length - captures.length} capture(s) with unknown tool name`);
+        }
         if (captures.length > 0) {
+          if (!firstCaptureAt) firstCaptureAt = Date.now();
+          if (Date.now() - firstCaptureAt < CONFIG.bridgeBatchMs) continue;
           await interruptSession(sessionId);
           const toolCalls = captures.map((c, i) => ({
             id: `call_${Date.now().toString(36)}${i}`,
