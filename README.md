@@ -143,6 +143,51 @@ openclaw agent -m "Reply with exactly: TEST_OK. Do not use any tools." \
 
 Rollback is one copy: `cp ~/.openclaw/openclaw.json.pre-proxy-bak ~/.openclaw/openclaw.json`.
 
+### Tool bridge v4.1 (OpenClaw tools work through the proxy)
+
+Text-only proxying can't trigger OpenClaw's tool loop (the harness acts only on
+`tool_calls`, which a plain completion never returns). v4.1 adds a bridge so UI
+chat gets **free model + OpenClaw tools**, no billing, no OpenClaw core changes:
+
+```
+OpenClaw harness --tools--> proxy --prompt + tool catalog--> opencode loop
+      ^                         |  oc_call capture files  |
+      └-- executes real tools --┘<---- tool_calls ---------┘
+```
+
+How it works:
+
+1. A static MCP server (`bridge/ocbridge.cjs`) exposes exactly ONE tool,
+   `oc_call {tool, arguments}`. It never executes anything — it records the
+   call under `~/.openclaw/bridge-calls/<sessionId>.jsonl` and returns a
+   stop sentinel.
+2. On any chat request containing `tools`, the proxy spawns a throwaway
+   session, injects the caller's function schemas as `<openclaw_tools>` JSON
+   plus a strict call-only-that-tool protocol, and polls the capture files.
+3. On capture it interrupts the loop and returns real OpenAI `tool_calls`
+   (`finish_reason: tool_calls`, streaming supported). OpenClaw executes with
+   its own tools; results come back next turn and the loop continues.
+4. No capture by timeout → falls back to the text answer (v4.0 behavior).
+
+Setup (one-time, on top of the proxy install):
+
+```bash
+cp bridge/ocbridge.cjs ~/.openclaw/
+mkdir -p ~/.openclaw/bridge-calls
+# merge bridge/opencode-mcp-snippet.jsonc into ~/.config/opencode/opencode.jsonc
+# under mcp.servers, then:
+systemctl --user restart opencode.service   # picks up the MCP server
+```
+
+Env flags: `BRIDGE_ENABLED` (default `true`; `false` = pure v4.0 text),
+`BRIDGE_DIR` (capture dir, default `~/.openclaw/bridge-calls`).
+`tool_choice: "none"` also bypasses the bridge per request.
+
+Limits: tool *selection* relies on the model reading the injected catalog
+(verified working on big-pickle/mimo-v2.5-free, incl. parallel calls);
+each bridge turn costs one extra loop pass; bridge sessions are deleted after
+every turn (no cross-talk, no leaks).
+
 ## Verify
 
 ```bash

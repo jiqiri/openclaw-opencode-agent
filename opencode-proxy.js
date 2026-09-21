@@ -36,6 +36,10 @@ const CONFIG = {
   // Prepended to every prompt (v2 /prompt has no native `system` field)
   systemPromptInjection: process.env.SYSTEM_PROMPT_INJECTION ||
     'IMPORTANT: If you need to ask the user a question, a preference, or offer options — write it directly as text in your response. NEVER use internal interactive question/form tools. List options as a numbered list and end with "Please reply with your choice." The user will respond in their next message.',
+  // Tool bridge (v4.1): translate OpenAI `tools` into oc_call bridge captures.
+  // Requires the ocbridge MCP server in opencode config (see README).
+  bridgeEnabled: process.env.BRIDGE_ENABLED !== 'false',
+  bridgeDir: process.env.BRIDGE_DIR || (process.env.HOME + '/.openclaw/bridge-calls'),
 };
 
 const SDK_PASSWORD = process.env.OPENCODE_SERVER_PASSWORD;
@@ -209,6 +213,165 @@ async function waitForIdle(sessionId) {
     clearInterval(poller);
   }
   await autoReplyPermissions(sessionId).catch(() => {});
+}
+
+const fs = await import('fs');
+
+// ─── Tool bridge (v4.1) ─────────────────────────────────────────────────────
+// OpenAI tools -> oc_call MCP captures -> OpenAI tool_calls.
+// The ocbridge MCP server (static, in opencode config) exposes ONE tool:
+//
+//   oc_call { tool: "<exact OpenClaw function name>", arguments: "<JSON string>" }
+//
+// Per request the proxy injects the caller's function schemas as
+// <openclaw_tools> JSON + a strict protocol. When the loop calls oc_call,
+// this server records {tool, arguments} to BRIDGE_DIR/<sessionId>.jsonl.
+// The proxy polls those files, interrupts the loop, and returns real
+// OpenAI tool_calls for OpenClaw to execute with its own tools.
+function buildBridgeProtocol(tools) {
+  const fns = (tools || [])
+    .filter((t) => t?.type === 'function' && t?.function?.name)
+    .map((t) => ({ name: t.function.name, description: t.function.description || '', parameters: t.function.parameters || { type: 'object', properties: {} } }));
+  return `You have exactly ONE tool available: oc_call. Its input schema is {"tool": "string (exact function name below)", "arguments": "string (JSON object string for that function)"}.
+<openclaw_tools>
+${JSON.stringify(fns)}
+</openclaw_tools>
+PROTOCOL (follow exactly):
+1. If the user request needs an OpenClaw function, call oc_call with the exact "tool" name and "arguments" as a JSON string. You may call oc_call multiple times for parallel needs.
+2. Do NOT use any other tools (no file/shell/web tools) when an OpenClaw function applies.
+3. After calling oc_call, STOP. Do not write any text after the calls.
+4. If no OpenClaw function applies, answer with plain text and call nothing.`;
+}
+
+function renderConversation(messages) {
+  // OpenAI messages (incl. prior assistant tool_calls + tool results) -> text.
+  const parts = [];
+  for (const msg of messages) {
+    if (msg.role === 'system') continue;
+    if (typeof msg.content === 'string' && msg.content) {
+      parts.push(msg.role === 'assistant' ? `[Assistant]\n${msg.content}` : `[User]\n${msg.content}`);
+    } else if (Array.isArray(msg.content)) {
+      const t = msg.content.filter((p) => p.type === 'text' && p.text).map((p) => p.text).join('\n');
+      if (t) parts.push(`[User]\n${t}`);
+    }
+    if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+      for (const tc of msg.tool_calls) {
+        parts.push(`[Assistant requested tool: ${tc.function?.name} ${tc.function?.arguments || ''}]`);
+      }
+    }
+    if (msg.role === 'tool') {
+      const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+      parts.push(`[Tool ${msg.name || ''} returned: ${content}]`);
+    }
+  }
+  return parts.join('\n\n') || ' ';
+}
+
+function readCaptures(sessionId) {
+  try {
+    const raw = fs.readFileSync(`${CONFIG.bridgeDir}/${sessionId}.jsonl`, 'utf8');
+    return raw.split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  } catch { return []; }
+}
+
+function clearCaptures(sessionId) {
+  try { fs.unlinkSync(`${CONFIG.bridgeDir}/${sessionId}.jsonl`); } catch {}
+}
+
+async function deleteSession(sessionId) {
+  try {
+    await fetch(`${CONFIG.sdkUrl}/api/session/${sessionId}`, {
+      method: 'DELETE', headers: { Authorization: SDK_AUTH },
+    });
+  } catch {}
+}
+
+async function interruptSession(sessionId) {
+  try {
+    await fetch(`${CONFIG.sdkUrl}/api/experimental/session/${sessionId}/interrupt`, {
+      method: 'POST', headers: authHeaders(), body: '{}',
+    });
+  } catch {}
+  try {
+    await fetch(`${CONFIG.sdkUrl}/api/session/${sessionId}/interrupt`, {
+      method: 'POST', headers: authHeaders(), body: '{}',
+    });
+  } catch {}
+}
+
+async function sendPromptWithTools(authKey, modelId, variant, text, files, systemPrompt, tools) {
+  // Fresh throwaway session per tool turn (never reuse: avoids cross-talk).
+  const modelRef = { providerID: 'opencode', id: modelId };
+  if (variant) modelRef.variant = variant;
+  const created = await sdkPost('/api/session', {
+    model: modelRef,
+    permissions: [{ action: '*', resource: '*', effect: 'allow' }],
+  });
+  const sessionId = created?.data?.id;
+  if (!sessionId) throw new Error('Failed to create bridge session');
+  log('info', `Bridge session: ${sessionId} for ${modelId}`);
+  try {
+    clearCaptures(sessionId);
+    const protocol = buildBridgeProtocol(tools);
+    const fullText = [systemPrompt, protocol, text].filter(Boolean).join('\n\n');
+    const body = { text: fullText };
+    if (files.length > 0) body.files = files;
+    const sentAt = Date.now();
+    await sdkPost(`/api/session/${sessionId}/prompt`, body, 30000);
+
+    // Race: captures (tool calls) vs fresh assistant text (direct answer).
+    // Poll in slices so text answers return fast instead of waiting out
+    // the full timeout.
+    const poller = setInterval(() => {
+      autoReplyPermissions(sessionId).catch(() => {});
+      autoReplyForms(sessionId).catch(() => {});
+    }, CONFIG.pollIntervalMs);
+    const deadline = Date.now() + CONFIG.requestTimeoutMs;
+    try {
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, CONFIG.pollIntervalMs));
+        const captures = readCaptures(sessionId);
+        if (captures.length > 0) {
+          await interruptSession(sessionId);
+          const toolCalls = captures.map((c, i) => ({
+            id: `call_${Date.now().toString(36)}${i}`,
+            type: 'function',
+            function: {
+              name: String(c.arguments?.tool || ''),
+              arguments: typeof c.arguments?.arguments === 'string'
+                ? c.arguments.arguments
+                : JSON.stringify(c.arguments?.arguments ?? {}),
+            },
+          })).filter((tc) => tc.function.name);
+          if (toolCalls.length > 0) return { toolCalls };
+        }
+        // Fresh assistant text after our prompt => direct answer, no tools.
+        try {
+          const listed = await sdkGet(`/api/session/${sessionId}/message?order=desc&limit=5`);
+          const fresh = (listed?.data || []).find((m) =>
+            m?.type === 'assistant' && (m?.time?.created || 0) >= sentAt &&
+            (m?.content || []).some((c) => c.type === 'text' && c.text));
+          if (fresh) {
+            const out = extractAssistant([fresh]);
+            if (out?.textContent) return { textResult: out };
+          }
+        } catch {}
+      }
+    } finally {
+      clearInterval(poller);
+    }
+    await interruptSession(sessionId);
+
+    // Fallback: no bridge call -> return latest text from the session.
+    await waitForIdle(sessionId).catch(() => {});
+    const listed = await sdkGet(`/api/session/${sessionId}/message?order=asc&limit=100`);
+    const result = extractAssistant(listed?.data);
+    return { textResult: result };
+  } finally {
+    clearCaptures(sessionId);
+    await deleteSession(sessionId);
+    sessions.delete(sessionKey(authKey, modelId, variant));
+  }
 }
 
 // ─── Message helpers ────────────────────────────────────────────────────────
@@ -388,6 +551,47 @@ async function writeStreamedResponse(res, responseText, model, tokenUsage) {
   res.end();
 }
 
+function buildToolCallsResponse(toolCalls, model) {
+  return {
+    id: 'chatcmpl-' + Date.now(),
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model,
+    provider: 'opencode',
+    system_fingerprint: null,
+    choices: [{
+      index: 0, logprobs: null, finish_reason: 'tool_calls',
+      message: { role: 'assistant', content: null, refusal: null, tool_calls: toolCalls },
+    }],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cost: 0, is_byok: false },
+  };
+}
+
+async function writeStreamedToolCalls(res, toolCalls, model) {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  const chatId = 'chatcmpl-' + Date.now();
+  const created = Math.floor(Date.now() / 1000);
+  res.write(`data: ${JSON.stringify({
+    id: chatId, object: 'chat.completion.chunk', created, model,
+    choices: [{ index: 0, delta: { role: 'assistant', content: null }, finish_reason: null }],
+  })}\n\n`);
+  res.write(`data: ${JSON.stringify({
+    id: chatId, object: 'chat.completion.chunk', created, model,
+    choices: [{ index: 0, delta: { tool_calls: toolCalls }, finish_reason: null }],
+  })}\n\n`);
+  res.write(`data: ${JSON.stringify({
+    id: chatId, object: 'chat.completion.chunk', created, model,
+    choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
+  })}\n\n`);
+  res.write('data: [DONE]\n\n');
+  res.end();
+}
+
 function buildCompletionResponse(responseText, model, tokenUsage, contextWindow) {
   return {
     id: 'chatcmpl-' + Date.now(),
@@ -429,7 +633,7 @@ const server = http.createServer(async (req, res) => {
     } catch {}
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
-      status: 'ok', version: '4.0', proxy: 'running',
+      status: 'ok', version: '4.1', proxy: 'running',
       sdk: sdkStatus, uptime: process.uptime(), sessions: sessions.size,
       autoApprove: CONFIG.autoApprovePermissions,
       reasoningFormat: CONFIG.reasoningFormat,
@@ -477,8 +681,39 @@ const server = http.createServer(async (req, res) => {
         const userSystem = extractSystemPrompt(messages);
         const fullSystem = [CONFIG.systemPromptInjection, userSystem].filter(Boolean).join('\n\n');
         const { text, files } = buildPromptInput(messages);
-        log('info', `Request: model=${modelId}${variant ? ':' + variant : ''}, msgs=${messages.length}, stream=${isStreaming}, files=${files.length}`);
+        const tools = Array.isArray(data.tools) ? data.tools.filter((t) => t?.type === 'function') : [];
+        const toolChoice = data.tool_choice;
+        const toolChoiceNone = toolChoice === 'none' || toolChoice?.type === 'none' || toolChoice?.function === 'none';
+        const useBridge = CONFIG.bridgeEnabled && tools.length > 0 && !toolChoiceNone;
+        log('info', `Request: model=${modelId}${variant ? ':' + variant : ''}, msgs=${messages.length}, stream=${isStreaming}, files=${files.length}, tools=${tools.length}, bridge=${useBridge}`);
         const authKey = req.headers.authorization || 'default';
+
+        if (useBridge) {
+          const convText = renderConversation(messages);
+          const result = await sendPromptWithTools(authKey, modelId, variant, convText, files, fullSystem, tools);
+          if (result.toolCalls) {
+            log('info', `Bridge: ${result.toolCalls.length} tool call(s): ${result.toolCalls.map((t) => t.function.name).join(', ')}`);
+            if (isStreaming) {
+              await writeStreamedToolCalls(res, result.toolCalls, rawModel);
+            } else {
+              res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' });
+              res.end(JSON.stringify(buildToolCallsResponse(result.toolCalls, rawModel)));
+            }
+            return;
+          }
+          // Fallback to text below.
+          const tr = result.textResult;
+          const finalText = (tr?.responseText) || '[No response from model]';
+          log('info', `Bridge fallback to text: ${finalText.length}c`);
+          if (isStreaming) {
+            await writeStreamedResponse(res, finalText, rawModel, tr?.tokenUsage || { input: 0, output: 0 });
+          } else {
+            res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' });
+            res.end(JSON.stringify(buildCompletionResponse(finalText, rawModel, tr?.tokenUsage || { input: 0, output: 0 }, catalogEntry.contextWindow)));
+          }
+          return;
+        }
+
         const { responseText, reasoningContent, tokenUsage } = await sendPrompt(authKey, modelId, variant, text, files, fullSystem);
         const finalText = responseText || '[No response from model]';
         log('info', `Response: ${finalText.length}c (reasoning: ${reasoningContent.length}c), tokens: in=${tokenUsage.input} out=${tokenUsage.output}`);
@@ -506,7 +741,7 @@ const server = http.createServer(async (req, res) => {
 
 // ─── Start ──────────────────────────────────────────────────────────────────
 server.listen(CONFIG.port, CONFIG.bindHost, () => {
-  log('info', `Proxy v4.0 running on http://${CONFIG.bindHost}:${CONFIG.port}`);
+  log('info', `Proxy v4.1 running on http://${CONFIG.bindHost}:${CONFIG.port}`);
   log('info', `SDK: ${CONFIG.sdkUrl} | Timeout: ${CONFIG.requestTimeoutMs}ms`);
   log('info', `Auto-approve: ${CONFIG.autoApprovePermissions} | Reasoning: ${CONFIG.reasoningFormat}`);
 });

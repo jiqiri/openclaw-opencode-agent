@@ -1,0 +1,15 @@
+// Merge into ~/.config/opencode/opencode.jsonc, then:
+//   systemctl --user restart opense... (opencode.service)
+// The bridge MCP exposes ONE tool (oc_call). The proxy (v4.1+) injects the
+// caller's function schemas per request and translates captures back into
+// OpenAI tool_calls. The server never executes anything itself.
+{
+  "mcp": {
+    "servers": {
+      "ocbridge": {
+        "type": "local",
+        "command": ["node", "/home/info/.openclaw/ocbridge.cjs"]
+      }
+    }
+  }
+}
