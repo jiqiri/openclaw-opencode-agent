@@ -1,0 +1,14 @@
+[Unit]
+Description=OpenCode Proxy v4.0 (OpenAI API -> opencode serve, port 5200)
+After=opencode.service
+Wants=opencode.service
+
+[Service]
+WorkingDirectory=%h/.openclaw
+EnvironmentFile=%h/.openclaw/.opencode-password.env
+ExecStart=/usr/bin/node %h/.openclaw/opencode-proxy.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

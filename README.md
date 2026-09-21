@@ -62,6 +62,33 @@ exports it, starts server → proxy in order with port checks). Preferred:
 ~/.openclaw/stop-openclaw.sh    # stop
 ```
 
+### systemd (recommended — survives SSH logout)
+
+Shell-started processes die with your SSH session. User systemd units with
+lingering keep everything alive after logout:
+
+```bash
+# 1. Portable password env file (no secrets in unit files)
+printf 'OPENCODE_SERVER_PASSWORD=%s\n' "$(cat ~/.openclaw/.opencode-password)" \
+  > ~/.openclaw/.opencode-password.env
+chmod 600 ~/.openclaw/.opencode-password.env
+
+# 2. Install the units from this repo
+cp systemd/opencode.service systemd/opencode-proxy.service ~/.config/systemd/user/
+
+# 3. Enable + start, allow lingering
+systemctl --user daemon-reload
+systemctl --user enable --now opencode.service opencode-proxy.service
+loginctl enable-linger  # one-time: keeps user services running after logout
+
+# 4. Confirm
+systemctl --user is-active opencode opencode-proxy
+curl http://127.0.0.1:5200/health   # "sdk":"reachable"
+```
+
+You can now exit SSH — both services keep running (`Restart=always` also
+recovers them from crashes).
+
 If the proxy exits with `OPENCODE_SERVER_PASSWORD is required`, or the SDK keeps
 returning `401`, the password env is missing or doesn't match the server's —
 restart both from the same exported value.
@@ -82,6 +109,39 @@ chmod +x ~/.openclaw/start-openclaw.sh ~/.openclaw/stop-openclaw.sh
 > provider plugin — do **not** overwrite `~/.openclaw/openclaw.json` with it.
 > To route OpenClaw through the proxy, register a custom OpenAI-compatible
 > provider with base URL `http://127.0.0.1:5200/`.
+
+### Wire OpenClaw chat to the free models (additive, no breakage)
+
+OpenClaw ≥ 2026.9 merges custom providers over its built-ins
+(`models.mode: "merge"`), so this only *adds* a provider and switches two model
+ids — plugins, channels, gateway settings are untouched:
+
+```bash
+# 1. Back up (one-off safety net)
+cp ~/.openclaw/openclaw.json ~/.openclaw/openclaw.json.pre-proxy-bak
+
+# 2. Register the proxy as provider "proxy" (dry-run first)
+openclaw config patch --file - --dry-run <<'EOF'
+{ models: { mode: "merge", providers: { proxy: {
+  baseUrl: "http://127.0.0.1:5200/", api: "openai-completions", models: [
+    { id: "proxy/big-pickle", name: "Big Pickle (local proxy)",
+      api: "openai-completions", input: ["text"], contextWindow: 200000, maxTokens: 32000 },
+    { id: "proxy/mimo-v2.5-free", name: "MiMo V2.5 Free (local proxy)",
+      api: "openai-completions", input: ["text", "image"], contextWindow: 200000, maxTokens: 32000 }
+  ] } } } }
+EOF
+# remove --dry-run to apply (no gateway restart needed)
+
+# 3. Point the default agent at the proxy model
+openclaw config set agents.defaults.model.primary proxy/big-pickle
+openclaw config set agents.entries.main.model proxy/big-pickle
+
+# 4. Verify — expect provider "proxy", cost 0
+openclaw agent -m "Reply with exactly: TEST_OK. Do not use any tools." \
+  --json --timeout 180
+```
+
+Rollback is one copy: `cp ~/.openclaw/openclaw.json.pre-proxy-bak ~/.openclaw/openclaw.json`.
 
 ## Verify
 
@@ -150,8 +210,9 @@ listing the valid ones.
 | File | Description |
 |------|-------------|
 | `opencode-proxy.js` | Proxy v4.0 (OpenAI API → `opencode serve` v2 API) |
-| `start-openclaw.sh` | Starts server + proxy with shared password file |
-| `stop-openclaw.sh` | Stops server + proxy |
+| `start-openclaw.sh` | Starts server + proxy with shared password file (manual/shell use) |
+| `stop-openclaw.sh` | Stops server + proxy (manual/shell use) |
+| `opencode.service` / `opencode-proxy.service` | systemd user units (`systemd/`, copy to `~/.config/systemd/user/`) |
 | `openclaw.json` / `install.sh` / `update.sh` / `openclaw.service` | Legacy (pre-2026.9 OpenClaw format), kept for reference |
 
 ## Security
