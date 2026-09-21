@@ -1,4 +1,4 @@
-# OpenClaw + opencode Proxy (v4.0)
+# OpenClaw + opencode Proxy (v4.1, tool bridge)
 
 OpenAI-compatible proxy (`opencode-proxy.js`) that exposes free opencode models
 (Big Pickle, MiMo, Nemotron, Muse Spark, …) to OpenClaw through `opencode serve`.
@@ -12,10 +12,11 @@ No opencode API key needed — the proxy reuses the models and limits of your lo
 OpenClaw (port 18789)
    │  OpenAI-compatible API
    ▼
-opencode-proxy.js v4.0 (127.0.0.1:5200)
+opencode-proxy.js v4.1 (127.0.0.1:5200)
    │  opencode serve v2 HTTP API + Basic password auth
+   │  (+ ocbridge MCP captures → OpenAI tool_calls when request has tools)
    ▼
-opencode serve (127.0.0.1:5100)
+opencode serve (127.0.0.1:5100) + ocbridge MCP server
    ▼
 opencode free models
 ```
@@ -76,6 +77,12 @@ chmod 600 ~/.openclaw/.opencode-password.env
 # 2. Install the units from this repo
 cp systemd/opencode.service systemd/opencode-proxy.service ~/.config/systemd/user/
 
+# 2b. Bridge prerequisites (required for tool calls, harmless otherwise)
+mkdir -p ~/.openclaw/bridge-calls
+cp bridge/ocbridge.cjs ~/.openclaw/
+# merge bridge/opencode-mcp-snippet.jsonc into ~/.config/opencode/opencode.jsonc
+# under mcp.servers (serve restart below picks it up)
+
 # 3. Enable + start, allow lingering
 systemctl --user daemon-reload
 systemctl --user enable --now opencode.service opencode-proxy.service
@@ -98,10 +105,13 @@ restart both from the same exported value.
 ```bash
 git clone <this-repo>
 cd openclaw-opencode-agent
-mkdir -p ~/.openclaw/logs
-cp opencode-proxy.js start-openclaw.sh stop-openclaw.sh ~/.openclaw/
+mkdir -p ~/.openclaw/logs ~/.openclaw/bridge-calls
+cp opencode-proxy.js start-openclaw.sh stop-openclaw.sh bridge/ocbridge.cjs ~/.openclaw/
 chmod +x ~/.openclaw/start-openclaw.sh ~/.openclaw/stop-openclaw.sh
+# merge bridge/opencode-mcp-snippet.jsonc into ~/.config/opencode/opencode.jsonc
+# under mcp.servers (required for the v4.1 tool bridge), then:
 ~/.openclaw/start-openclaw.sh
+# ...or prefer systemd (below), which also survives SSH logout.
 ```
 
 > Note: `openclaw.json` / `install.sh` / `update.sh` in this repo target the legacy
@@ -192,7 +202,7 @@ every turn (no cross-talk, no leaks).
 
 ```bash
 curl http://127.0.0.1:5200/health
-# {"status":"ok","version":"4.0","proxy":"running","sdk":"reachable",...}
+# {"status":"ok","version":"4.1","proxy":"running","sdk":"reachable",...}
 # "sdk":"unreachable" almost always means a password mismatch (see above).
 
 curl http://127.0.0.1:5200/v1/models
@@ -254,7 +264,9 @@ listing the valid ones.
 
 | File | Description |
 |------|-------------|
-| `opencode-proxy.js` | Proxy v4.0 (OpenAI API → `opencode serve` v2 API) |
+| `opencode-proxy.js` | Proxy v4.1 (OpenAI API → `opencode serve` v2 API + tool bridge) |
+| `bridge/ocbridge.cjs` | Static MCP bridge server (single `oc_call` capture tool; copy to `~/.openclaw/`) |
+| `bridge/opencode-mcp-snippet.jsonc` | MCP registration snippet (merge into opencode config, restart serve) |
 | `start-openclaw.sh` | Starts server + proxy with shared password file (manual/shell use) |
 | `stop-openclaw.sh` | Stops server + proxy (manual/shell use) |
 | `opencode.service` / `opencode-proxy.service` | systemd user units (`systemd/`, copy to `~/.config/systemd/user/`) |
