@@ -1,38 +1,55 @@
 #!/usr/bin/env node
-// OpenCode SDK Proxy — v3.1
-// Uses direct HTTP calls to the SDK (bypassing SDK client bugs with `parts`)
-// Features: auto-approve permissions, auto-answer questions, reasoning separation,
-//           auto-reconnect, chunked streaming, system prompt injection
+// OpenCode SDK Proxy — v4.0 (opencode serve v2 API)
+// Talks to `opencode serve` v2.x HTTP API with pure fetch (no @opencode-ai/sdk,
+// whose 1.x client targets the old /message sync API).
+//
+// Flow per chat request:
+//   1. POST /api/session {model, permissions}            → session id
+//   2. POST /api/session/{id}/prompt {text, files?}      → queues user msg
+//   3. POST /api/experimental/session/{id}/wait          → blocks until idle
+//      (concurrently: GET .../permission → POST .../reply {decision:'always'},
+//       best-effort form replies)
+//   4. GET  /api/session/{id}/message?order=asc          → last assistant msg
+//
+// Env: PROXY_PORT, SDK_URL, BIND_HOST, REQUEST_TIMEOUT_MS, STREAM_CHUNK_SIZE,
+// STREAM_CHUNK_DELAY_MS, LOG_LEVEL, REASONING_FORMAT, AUTO_APPROVE_PERMISSIONS,
+// POLL_INTERVAL_MS, SYSTEM_PROMPT_INJECTION, OPENCODE_SERVER_PASSWORD (required —
+// must match the password of `opencode serve`; Basic auth user is `opencode`).
 
-import os from 'os';
-import path from 'path';
 import http from 'http';
-
-const { createOpencodeClient } = await import(
-  path.join(os.homedir(), '.npm-global', 'lib', 'node_modules', '@opencode-ai', 'sdk', 'dist', 'index.js')
-);
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 const CONFIG = {
   port: parseInt(process.env.PROXY_PORT || '5200', 10),
-  sdkUrl: process.env.SDK_URL || 'http://127.0.0.1:5100',
+  sdkUrl: (process.env.SDK_URL || 'http://127.0.0.1:5100').replace(/\/$/, ''),
   bindHost: process.env.BIND_HOST || '127.0.0.1',
-  requestTimeoutMs: parseInt(process.env.REQUEST_TIMEOUT_MS || '120000', 10),
+  requestTimeoutMs: parseInt(process.env.REQUEST_TIMEOUT_MS || '180000', 10),
   streamChunkSize: parseInt(process.env.STREAM_CHUNK_SIZE || '80', 10),
   streamChunkDelayMs: parseInt(process.env.STREAM_CHUNK_DELAY_MS || '15', 10),
   logLevel: process.env.LOG_LEVEL || 'info',
   // Reasoning format: blockquote | details | hidden | inline
   reasoningFormat: process.env.REASONING_FORMAT || 'blockquote',
-  // Auto-approve file permissions
+  // Auto-approve tool/file permission requests (else the agent loop stalls)
   autoApprovePermissions: process.env.AUTO_APPROVE_PERMISSIONS !== 'false',
-  // Auto-answer model questions (picks first option)
-  autoAnswerQuestions: process.env.AUTO_ANSWER_QUESTIONS !== 'false',
-  // Polling interval for permissions/questions
-  pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || '500', 10),
-  // System prompt to inject (tells model to ask questions as text, not via tool)
+  // Polling interval while waiting for the agent loop
+  pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || '750', 10),
+  // Prepended to every prompt (v2 /prompt has no native `system` field)
   systemPromptInjection: process.env.SYSTEM_PROMPT_INJECTION ||
-    'IMPORTANT: If you need to ask the user a question, a preference, or offer options — write it directly as text in your response. NEVER use internal interactive question tools. List options as a numbered list and end with "Please reply with your choice." The user will respond in their next message.',
+    'IMPORTANT: If you need to ask the user a question, a preference, or offer options — write it directly as text in your response. NEVER use internal interactive question/form tools. List options as a numbered list and end with "Please reply with your choice." The user will respond in their next message.',
 };
+
+const SDK_PASSWORD = process.env.OPENCODE_SERVER_PASSWORD;
+if (!SDK_PASSWORD) {
+  console.error(
+    '❌ [ERROR] OPENCODE_SERVER_PASSWORD is required.\n' +
+    '   Start the proxy with the same password as `opencode serve`, e.g.:\n' +
+    '   export OPENCODE_SERVER_PASSWORD=$(tr \'\\0\' \'\\n\' < /proc/$(pgrep -f "opencode serve" | head -n1)/environ | grep OPENCODE_SERVER_PASSWORD | cut -d= -f2-)\n' +
+    '   (Better: generate one password, store it in ~/.openclaw/.opencode-password,\n' +
+    '    and export it before starting BOTH `opencode serve` and this proxy.)'
+  );
+  process.exit(1);
+}
+const SDK_AUTH = 'Basic ' + Buffer.from(`opencode:${SDK_PASSWORD}`).toString('base64');
 
 // ─── Logger ─────────────────────────────────────────────────────────────────
 const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
@@ -43,205 +60,200 @@ function log(level, msg) {
   }
 }
 
-// ─── Model Catalog ──────────────────────────────────────────────────────────
+// ─── Model Catalog (live `opencode` provider, refreshed 2026-09) ────────────
+// NOTE: opencode's free-model lineup rotates. Refresh with:
+//   curl -su opencode:$OPENCODE_SERVER_PASSWORD $SDK_URL/api/model
 const MODEL_CATALOG = [
-  { id: 'big-pickle', name: 'Big Pickle', contextWindow: 200000, maxTokens: 64000, input: ['text'], reasoning: true, variants: ['high', 'max'] },
-  { id: 'qwen3.6-plus-free', name: 'Qwen3.6 Plus Free', contextWindow: 131072, maxTokens: 16384, input: ['text'], reasoning: false, variants: [] },
-  { id: 'gpt-5-nano', name: 'GPT-5 Nano', contextWindow: 128000, maxTokens: 16384, input: ['text'], reasoning: false, variants: [] },
-  { id: 'minimax-m2.5-free', name: 'MiniMax M2.5 Free', contextWindow: 100000, maxTokens: 16384, input: ['text'], reasoning: false, variants: [] },
-  { id: 'nemotron-3-super-free', name: 'Nemotron 3 Super Free', contextWindow: 100000, maxTokens: 16384, input: ['text'], reasoning: false, variants: ['low', 'medium', 'high'] },
+  { id: 'big-pickle', name: 'Big Pickle', contextWindow: 200000, maxTokens: 32000, input: ['text'], reasoning: true },
+  { id: 'mimo-v2.5-free', name: 'MiMo V2.5 Free', contextWindow: 200000, maxTokens: 32000, input: ['text', 'image'], reasoning: true },
+  { id: 'nemotron-3-ultra-free', name: 'Nemotron 3 Ultra Free', contextWindow: 1000000, maxTokens: 128000, input: ['text'], reasoning: false },
+  { id: 'nemotron-3.5-lightning-free', name: 'Nemotron 3.5 Lightning Free', contextWindow: 262144, maxTokens: 262144, input: ['text'], reasoning: false },
+  { id: 'muse-spark-1.3-contributor-free', name: 'Muse Spark 1.3 Free', contextWindow: 1048576, maxTokens: 131072, input: ['text', 'image'], reasoning: true },
+  { id: 'muse-spark-1.2-contributor-free', name: 'Muse Spark 1.2 Free', contextWindow: 1048576, maxTokens: 131072, input: ['text', 'image'], reasoning: true },
+  { id: 'ling-3.0-flash-fin-free', name: 'Ling 3.0 Flash Fin Free', contextWindow: 262144, maxTokens: 32768, input: ['text'], reasoning: false },
 ];
 
-const MODEL_LOOKUP = new Map();
-for (const m of MODEL_CATALOG) {
-  MODEL_LOOKUP.set(m.id, m);
-  for (const v of m.variants) MODEL_LOOKUP.set(`${m.id}:${v}`, m);
-}
+// Deprecated ids from older proxy versions → live replacement (else clear 400)
+const MODEL_ALIASES = {
+  'mimo-v2-pro-free': 'mimo-v2.5-free',
+  'mimo-v2-omni-free': 'mimo-v2.5-free',
+  'minimax-m2.5-free': 'mimo-v2.5-free',
+  'nemotron-3-super-free': 'nemotron-3-ultra-free',
+  'qwen3.6-plus-free': 'ling-3.0-flash-fin-free',
+  'gpt-5-nano': 'ling-3.0-flash-fin-free',
+};
+
+const MODEL_LOOKUP = new Map(MODEL_CATALOG.map((m) => [m.id, m]));
 
 function buildModelsResponse() {
-  const data = [];
-  for (const m of MODEL_CATALOG) {
-    data.push({ id: `opencode/${m.id}`, name: m.name, context_window: m.contextWindow });
-    for (const v of m.variants) {
-      const suffix = v.charAt(0).toUpperCase() + v.slice(1);
-      data.push({ id: `opencode/${m.id}:${v}`, name: `${m.name} (${suffix})`, context_window: m.contextWindow });
-    }
-  }
-  return JSON.stringify({ data });
+  return JSON.stringify({
+    data: MODEL_CATALOG.map((m) => ({ id: `opencode/${m.id}`, name: m.name, context_window: m.contextWindow })),
+  });
 }
 const MODELS_RESPONSE_JSON = buildModelsResponse();
 
 // ─── Session Manager ────────────────────────────────────────────────────────
+// Sessions are bound to a model at creation (v2 sets model on create/switch).
 const sessions = new Map();
 function sessionKey(authKey, modelId, variant) {
   return `${authKey}::${modelId}::${variant || 'default'}`;
 }
 
-// ─── SDK Client (for session.create only) ───────────────────────────────────
-const sdkClient = createOpencodeClient({ baseUrl: CONFIG.sdkUrl });
+// ─── SDK HTTP helpers (pure fetch, Basic auth) ──────────────────────────────
+function authHeaders(extra) {
+  return { 'Content-Type': 'application/json', Authorization: SDK_AUTH, ...(extra || {}) };
+}
 
-// ─── Direct HTTP helpers for SDK ────────────────────────────────────────────
-// We use fetch directly because the SDK client has a bug where `parts` is not
-// sent in the body for session.prompt (the SDK's buildClientParams drops it).
+async function parseJsonOrEmpty(resp) {
+  const text = await resp.text();
+  if (!text) return null;
+  try { return JSON.parse(text); } catch { return null; }
+}
 
 async function sdkPost(urlPath, body, timeoutMs) {
   const controller = new AbortController();
   const timeout = timeoutMs ? setTimeout(() => controller.abort(), timeoutMs) : null;
-
   try {
     const resp = await fetch(`${CONFIG.sdkUrl}${urlPath}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      headers: authHeaders(),
+      body: JSON.stringify(body === undefined ? {} : body),
       signal: controller.signal,
     });
     if (timeout) clearTimeout(timeout);
-
+    if (resp.status === 204) return null;
     if (!resp.ok) {
       const errText = await resp.text();
-      throw new Error(`SDK ${urlPath} returned ${resp.status}: ${errText}`);
+      throw new Error(`SDK ${urlPath} returned ${resp.status}: ${errText.slice(0, 500)}`);
     }
-    return await resp.json();
+    return await parseJsonOrEmpty(resp);
   } catch (err) {
     if (timeout) clearTimeout(timeout);
-    if (err.name === 'AbortError') {
-      throw new Error(`SDK request timed out after ${timeoutMs}ms`);
-    }
+    if (err.name === 'AbortError') throw new Error(`SDK request timed out after ${timeoutMs}ms`);
     throw err;
   }
 }
 
 async function sdkGet(urlPath) {
-  const resp = await fetch(`${CONFIG.sdkUrl}${urlPath}`);
+  const resp = await fetch(`${CONFIG.sdkUrl}${urlPath}`, {
+    headers: { Authorization: SDK_AUTH },
+  });
   if (!resp.ok) return null;
-  return await resp.json();
+  return await parseJsonOrEmpty(resp);
 }
 
-// ─── Permission & Question Auto-Handler ─────────────────────────────────────
-let pollerInterval = null;
-
-function startPermissionPoller() {
-  log('info', `Permission/Question auto-handler started (poll every ${CONFIG.pollIntervalMs}ms)`);
-
-  pollerInterval = setInterval(async () => {
+// ─── Permission / form auto-approval (per-session, v2 endpoints) ────────────
+async function autoReplyPermissions(sessionId) {
+  if (!CONFIG.autoApprovePermissions) return;
+  let list;
+  try {
+    list = await sdkGet(`/api/session/${sessionId}/permission`);
+  } catch (e) {
+    log('debug', `perm list failed: ${e.message}`);
+    return;
+  }
+  const reqs = list?.data;
+  if (!Array.isArray(reqs) || reqs.length === 0) return;
+  for (const req of reqs) {
+    if (!req?.id) continue;
+    log('info', `Auto-approving permission: ${req.action} [${(req.resources || []).join(', ')}]`);
     try {
-      // Auto-approve pending permissions
-      if (CONFIG.autoApprovePermissions) {
-        const perms = await sdkGet('/permission');
-        if (Array.isArray(perms) && perms.length > 0) {
-          for (const perm of perms) {
-            const id = perm.id;
-            if (!id) continue;
-            log('info', `Auto-approving permission: ${perm.permission} [${(perm.patterns || []).join(', ')}]`);
-            try {
-              await sdkPost(`/permission/${id}/reply`, { reply: 'always' });
-              log('debug', `Permission ${id} approved ✓`);
-            } catch (e) {
-              log('warn', `Failed to approve permission ${id}: ${e.message}`);
-            }
-          }
-        }
-      }
-
-      // Auto-answer pending questions (or reject them to force text-based questions)
-      if (CONFIG.autoAnswerQuestions) {
-        const questions = await sdkGet('/question');
-        if (Array.isArray(questions) && questions.length > 0) {
-          for (const q of questions) {
-            const id = q.id;
-            if (!id) continue;
-
-            // Reject the question so the model reformulates as text
-            // (our system prompt tells it to do this)
-            log('info', `Rejecting question "${q.questions?.[0]?.header || 'unknown'}" to force text-based interaction`);
-            try {
-              await sdkPost(`/question/${id}/reject`, {});
-              log('debug', `Question ${id} rejected → model will reformulate as text`);
-            } catch (e) {
-              log('warn', `Failed to reject question ${id}: ${e.message}`);
-              // Try answering as fallback
-              try {
-                const answers = (q.questions || []).map(qi => {
-                  if (qi.options?.length > 0) return [qi.options[0].label];
-                  return ['yes'];
-                });
-                await sdkPost(`/question/${id}/reply`, { answers });
-                log('debug', `Question ${id} answered as fallback`);
-              } catch { /* ignore */ }
-            }
-          }
-        }
-      }
-    } catch (err) {
-      log('debug', `Poller: ${err.message}`);
+      await sdkPost(`/api/session/${sessionId}/permission/${req.id}/reply`, { decision: 'always' });
+    } catch (e) {
+      log('warn', `Failed to approve permission ${req.id}: ${e.message}`);
     }
-  }, CONFIG.pollIntervalMs);
-}
-
-function stopPermissionPoller() {
-  if (pollerInterval) {
-    clearInterval(pollerInterval);
-    pollerInterval = null;
   }
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+async function autoReplyForms(sessionId) {
+  // Best-effort: answer pending forms with the first option so the loop
+  // doesn't stall. Failures are non-fatal (logged at debug).
+  let list;
+  try {
+    list = await sdkGet(`/api/session/${sessionId}/form`);
+  } catch { return; }
+  const forms = list?.data;
+  if (!Array.isArray(forms) || forms.length === 0) return;
+  for (const f of forms) {
+    if (!f?.id) continue;
+    try {
+      const questions = f.questions || f.fields || [];
+      const answer = {};
+      for (const q of questions) {
+        const key = q.id || q.name || q.key;
+        if (!key) continue;
+        if (Array.isArray(q.options) && q.options.length > 0) {
+          const o = q.options[0];
+          answer[key] = o.value !== undefined ? o.value : (o.label !== undefined ? o.label : o);
+        } else {
+          answer[key] = 'yes';
+        }
+      }
+      log('info', `Auto-answering form ${f.id}`);
+      await sdkPost(`/api/session/${sessionId}/form/${f.id}/reply`, { answer });
+    } catch (e) {
+      log('debug', `Form ${f.id} auto-reply failed: ${e.message}`);
+    }
+  }
+}
+
+// Wait for the agent loop to go idle while sweeping permissions/forms.
+async function waitForIdle(sessionId) {
+  const poller = setInterval(() => {
+    autoReplyPermissions(sessionId).catch(() => {});
+    autoReplyForms(sessionId).catch(() => {});
+  }, CONFIG.pollIntervalMs);
+  try {
+    await sdkPost(`/api/experimental/session/${sessionId}/wait`, {}, CONFIG.requestTimeoutMs);
+  } finally {
+    clearInterval(poller);
+  }
+  await autoReplyPermissions(sessionId).catch(() => {});
+}
+
+// ─── Message helpers ────────────────────────────────────────────────────────
 function parseModel(rawModel) {
   let modelId = rawModel.includes('/') ? rawModel.split('/')[1] : rawModel;
   let variant = '';
   if (modelId.includes(':')) {
-    const parts = modelId.split(':');
-    modelId = parts[0];
-    variant = parts[1];
+    const i = modelId.indexOf(':');
+    variant = modelId.slice(i + 1);
+    modelId = modelId.slice(0, i);
+  }
+  if (MODEL_ALIASES[modelId]) {
+    log('warn', `Model "${modelId}" is retired, mapping to "${MODEL_ALIASES[modelId]}"`);
+    modelId = MODEL_ALIASES[modelId];
   }
   return { modelId, variant };
 }
 
-function buildPromptParts(messages) {
-  // Build conversation text & images from non-system messages
-  const fileParts = [];
+function buildPromptInput(messages) {
   const textParts = [];
-  
+  const files = [];
   for (const msg of messages) {
-    if (msg.role === 'system') continue; // system handled separately
+    if (msg.role === 'system') continue;
     const role = msg.role || 'user';
     let text = '';
-    
     if (typeof msg.content === 'string') {
       text = msg.content;
     } else if (Array.isArray(msg.content)) {
-      text = msg.content.filter(p => p.type === 'text').map(p => p.text).join('\n');
-      
+      text = msg.content.filter((p) => p.type === 'text').map((p) => p.text).join('\n');
       for (const p of msg.content) {
-        if (p.type === 'image_url' && p.image_url && p.image_url.url) {
-          const url = p.image_url.url;
-          let mime = 'image/jpeg';
-          const match = url.match(/^data:([^;]+);base64,/);
-          if (match) mime = match[1];
-          fileParts.push({ type: 'file', mime: mime, url: url });
+        if (p.type === 'image_url' && p.image_url?.url) {
+          files.push({ uri: p.image_url.url });
         }
       }
     }
-    
-    if (!text) continue;
-    if (role === 'assistant') {
-      textParts.push(`[Assistant]\n${text}`);
-    } else {
-      textParts.push(`[User]\n${text}`);
-    }
+    if (!text && files.length === 0) continue;
+    if (text) textParts.push(role === 'assistant' ? `[Assistant]\n${text}` : `[User]\n${text}`);
   }
-  
-  const finalText = textParts.join('\n\n');
-  const finalParts = [{ type: 'text', text: finalText || " " }];
-  finalParts.push(...fileParts);
-  
-  return finalParts;
+  return { text: textParts.join('\n\n') || ' ', files };
 }
 
 function extractSystemPrompt(messages) {
   return messages
-    .filter(m => m.role === 'system')
-    .map(m => typeof m.content === 'string' ? m.content : '')
+    .filter((m) => m.role === 'system')
+    .map((m) => (typeof m.content === 'string' ? m.content : ''))
     .filter(Boolean)
     .join('\n');
 }
@@ -254,83 +266,88 @@ function formatReasoning(text) {
     case 'inline': return text + '\n\n';
     case 'blockquote':
     default:
-      return `> 💭 *Thinking...*\n${text.split('\n').map(l => `> ${l}`).join('\n')}\n\n`;
+      return `> 💭 *Thinking...*\n${text.split('\n').map((l) => `> ${l}`).join('\n')}\n\n`;
   }
 }
 
-function extractResponse(data) {
+// v2 assistant message: {type:'assistant', content:[{type:'text'|'reasoning',text}], tokens:{...}}
+function extractAssistant(messagesData) {
+  const assistants = (messagesData || []).filter((m) => m?.type === 'assistant');
+  const last = assistants[assistants.length - 1];
+  if (!last) return null;
   let textContent = '';
   let reasoningContent = '';
-  const tokenUsage = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
-
-  if (data?.info?.tokens) {
-    const t = data.info.tokens;
-    tokenUsage.input = t.input || 0;
-    tokenUsage.output = t.output || 0;
-    tokenUsage.reasoning = t.reasoning || 0;
-    tokenUsage.cacheRead = t.cache?.read || 0;
-    tokenUsage.cacheWrite = t.cache?.write || 0;
-    tokenUsage.total = t.total || 0;
+  for (const c of last.content || []) {
+    if (c.type === 'text' && c.text) textContent += c.text;
+    else if (c.type === 'reasoning' && c.text) reasoningContent += c.text;
   }
-
-  if (data?.parts) {
-    for (const part of data.parts) {
-      if (part.type === 'text' && part.text) textContent += part.text;
-      else if (part.type === 'reasoning' && part.text) reasoningContent += part.text;
-    }
-  }
-
-  const formatted = formatReasoning(reasoningContent) + textContent;
-  return { responseText: formatted, textContent, reasoningContent, tokenUsage };
+  const t = last.tokens || {};
+  return {
+    textContent,
+    reasoningContent,
+    responseText: formatReasoning(reasoningContent) + textContent,
+    tokenUsage: {
+      input: t.input || 0,
+      output: t.output || 0,
+      reasoning: t.reasoning || 0,
+      cacheRead: t.cache?.read || 0,
+      cacheWrite: t.cache?.write || 0,
+      total: (t.input || 0) + (t.output || 0),
+    },
+  };
 }
 
-// ─── Session + Prompt with retry ────────────────────────────────────────────
+// ─── Session + prompt (v2) ──────────────────────────────────────────────────
 async function getOrCreateSession(authKey, modelId, variant) {
   const sKey = sessionKey(authKey, modelId, variant);
   const cached = sessions.get(sKey);
-  if (cached) return { sessionId: cached, sKey, isNew: false };
-
-  // Create session with permissions pre-approved
-  const session = await sdkClient.session.create({
-    permission: [{ permission: '*', pattern: '**', action: 'allow' }],
+  if (cached) return { sessionId: cached, sKey };
+  const modelRef = { providerID: 'opencode', id: modelId };
+  if (variant) modelRef.variant = variant;
+  const created = await sdkPost('/api/session', {
+    model: modelRef,
+    permissions: [{ action: '*', resource: '*', effect: 'allow' }],
   });
-  const sessionId = session.data?.id;
-  if (!sessionId) throw new Error('Failed to create session');
-
+  const sessionId = created?.data?.id;
+  if (!sessionId) throw new Error('Failed to create session (empty response)');
   sessions.set(sKey, sessionId);
   log('info', `New session: ${sessionId} for ${modelId}${variant ? ':' + variant : ''}`);
-  return { sessionId, sKey, isNew: true };
+  return { sessionId, sKey };
 }
 
-async function sendPrompt(authKey, modelId, variant, promptParts, systemPrompt) {
+async function ensureModel(sessionId, modelId, variant) {
+  const modelRef = { providerID: 'opencode', id: modelId };
+  if (variant) modelRef.variant = variant;
+  try {
+    await sdkPost(`/api/session/${sessionId}/model`, { model: modelRef });
+  } catch (e) {
+    log('debug', `ensureModel (non-fatal): ${e.message}`);
+  }
+}
+
+async function sendPrompt(authKey, modelId, variant, promptText, files, systemPrompt) {
   const maxRetries = 2;
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     const { sessionId, sKey } = await getOrCreateSession(authKey, modelId, variant);
-
     try {
-      const body = {
-        model: { providerID: 'opencode', modelID: modelId },
-        parts: promptParts,
-      };
-      if (variant) body.variant = variant;
-      if (systemPrompt) body.system = systemPrompt;
-
-      const data = await sdkPost(
-        `/session/${sessionId}/message`,
-        body,
-        CONFIG.requestTimeoutMs
-      );
-
-      return data;
-
+      await ensureModel(sessionId, modelId, variant);
+      const fullText = systemPrompt ? `${systemPrompt}\n\n${promptText}` : promptText;
+      const body = { text: fullText };
+      if (files.length > 0) body.files = files;
+      await sdkPost(`/api/session/${sessionId}/prompt`, body, 30000);
+      await waitForIdle(sessionId);
+      const listed = await sdkGet(`/api/session/${sessionId}/message?order=asc&limit=100`);
+      const result = extractAssistant(listed?.data);
+      if (!result || (!result.textContent && !result.reasoningContent)) {
+        throw new Error('Model returned no assistant message (check SDK logs / model availability)');
+      }
+      return result;
     } catch (err) {
       sessions.delete(sKey);
-
       if (err.message.includes('timed out')) throw err;
-
       if (attempt < maxRetries - 1) {
-        log('warn', `Prompt failed (attempt ${attempt + 1}), retrying: ${err.message}`);
-        await new Promise(r => setTimeout(r, 1000));
+        log('warn', `Prompt failed (attempt ${attempt + 1}), retrying with fresh session: ${err.message}`);
+        await new Promise((r) => setTimeout(r, 1000));
         continue;
       }
       throw err;
@@ -338,8 +355,8 @@ async function sendPrompt(authKey, modelId, variant, promptParts, systemPrompt) 
   }
 }
 
-// ─── Streaming ──────────────────────────────────────────────────────────────
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+// ─── Streaming (fake-chunked, OpenAI SSE shape) ─────────────────────────────
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 async function writeStreamedResponse(res, responseText, model, tokenUsage) {
   res.writeHead(200, {
@@ -348,17 +365,12 @@ async function writeStreamedResponse(res, responseText, model, tokenUsage) {
     'Connection': 'keep-alive',
     'X-Accel-Buffering': 'no',
   });
-
   const chatId = 'chatcmpl-' + Date.now();
   const created = Math.floor(Date.now() / 1000);
-
-  // Role chunk
   res.write(`data: ${JSON.stringify({
     id: chatId, object: 'chat.completion.chunk', created, model,
     choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }],
   })}\n\n`);
-
-  // Content chunks
   const cs = CONFIG.streamChunkSize;
   for (let i = 0; i < responseText.length; i += cs) {
     res.write(`data: ${JSON.stringify({
@@ -367,14 +379,11 @@ async function writeStreamedResponse(res, responseText, model, tokenUsage) {
     })}\n\n`);
     if (CONFIG.streamChunkDelayMs > 0) await sleep(CONFIG.streamChunkDelayMs);
   }
-
-  // Finish + usage (before DONE)
   res.write(`data: ${JSON.stringify({
     id: chatId, object: 'chat.completion.chunk', created, model,
     choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
     usage: { prompt_tokens: tokenUsage.input, completion_tokens: tokenUsage.output, total_tokens: tokenUsage.input + tokenUsage.output },
   })}\n\n`);
-
   res.write('data: [DONE]\n\n');
   res.end();
 }
@@ -399,10 +408,7 @@ function buildCompletionResponse(responseText, model, tokenUsage, contextWindow)
       prompt_tokens_details: { cached_tokens: tokenUsage.cacheRead, cache_write_tokens: tokenUsage.cacheWrite, audio_tokens: 0, video_tokens: 0 },
       completion_tokens_details: { reasoning_tokens: tokenUsage.reasoning, image_tokens: 0, audio_tokens: 0 },
     },
-    context: {
-      used: tokenUsage.total || (tokenUsage.input + tokenUsage.output),
-      available: contextWindow,
-    },
+    context: { used: tokenUsage.total, available: contextWindow },
   };
 }
 
@@ -411,37 +417,35 @@ const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-
   if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
 
-  const url = req.url.replace(/\/$/, '');
+  const url = (req.url || '/').split('?')[0].replace(/\/$/, '') || '/';
 
-  // Health
   if (url === '/health' && req.method === 'GET') {
-    let sdkReachable = false;
-    try { const r = await fetch(`${CONFIG.sdkUrl}/health`); sdkReachable = r.ok; } catch {}
+    let sdkStatus = 'unreachable';
+    try {
+      const r = await fetch(`${CONFIG.sdkUrl}/api/model`, { headers: { Authorization: SDK_AUTH } });
+      if (r.ok) sdkStatus = 'reachable';
+    } catch {}
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
-      status: 'ok', version: '3.1', proxy: 'running',
-      sdk: sdkReachable ? 'reachable' : 'unreachable',
-      uptime: process.uptime(), sessions: sessions.size,
+      status: 'ok', version: '4.0', proxy: 'running',
+      sdk: sdkStatus, uptime: process.uptime(), sessions: sessions.size,
       autoApprove: CONFIG.autoApprovePermissions,
       reasoningFormat: CONFIG.reasoningFormat,
     }));
     return;
   }
 
-  // Models
   if ((url === '/v1/models' || url === '/models') && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(MODELS_RESPONSE_JSON);
     return;
   }
 
-  // Chat completions
   if ((url === '/v1/chat/completions' || url === '/chat/completions') && req.method === 'POST') {
     let body = '';
-    req.on('data', c => body += c);
+    req.on('data', (c) => { body += c; });
     req.on('end', async () => {
       try {
         let data;
@@ -450,45 +454,34 @@ const server = http.createServer(async (req, res) => {
           res.end(JSON.stringify({ error: { message: 'Invalid JSON', type: 'invalid_request_error' } }));
           return;
         }
-
         const messages = data.messages;
         if (!Array.isArray(messages) || messages.length === 0) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: { message: '"messages" must be a non-empty array', type: 'invalid_request_error' } }));
           return;
         }
-
         const rawModel = data.model || 'big-pickle';
         const { modelId, variant } = parseModel(rawModel);
-        const lookupKey = variant ? `${modelId}:${variant}` : modelId;
-        const catalogEntry = MODEL_LOOKUP.get(lookupKey);
-
+        const catalogEntry = MODEL_LOOKUP.get(modelId);
         if (!catalogEntry) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: { message: `Unknown model "${rawModel}"`, type: 'invalid_request_error' } }));
+          res.end(JSON.stringify({
+            error: {
+              message: `Unknown model "${rawModel}". Available: ${MODEL_CATALOG.map((m) => 'opencode/' + m.id).join(', ')}`,
+              type: 'invalid_request_error',
+            },
+          }));
           return;
         }
-
         const isStreaming = data.stream === true;
-
-        // Extract system prompt from messages + inject our instruction
-        let userSystemPrompt = extractSystemPrompt(messages);
-        const fullSystemPrompt = [CONFIG.systemPromptInjection, userSystemPrompt]
-          .filter(Boolean).join('\n\n');
-
-        // Build conversational text and extract images from non-system messages
-        const promptParts = buildPromptParts(messages);
-
-        log('info', `Request: model=${modelId}${variant ? ':' + variant : ''}, msgs=${messages.length}, stream=${isStreaming}`);
-
+        const userSystem = extractSystemPrompt(messages);
+        const fullSystem = [CONFIG.systemPromptInjection, userSystem].filter(Boolean).join('\n\n');
+        const { text, files } = buildPromptInput(messages);
+        log('info', `Request: model=${modelId}${variant ? ':' + variant : ''}, msgs=${messages.length}, stream=${isStreaming}, files=${files.length}`);
         const authKey = req.headers.authorization || 'default';
-        const result = await sendPrompt(authKey, modelId, variant, promptParts, fullSystemPrompt);
-
-        const { responseText, reasoningContent, tokenUsage } = extractResponse(result);
+        const { responseText, reasoningContent, tokenUsage } = await sendPrompt(authKey, modelId, variant, text, files, fullSystem);
         const finalText = responseText || '[No response from model]';
-
         log('info', `Response: ${finalText.length}c (reasoning: ${reasoningContent.length}c), tokens: in=${tokenUsage.input} out=${tokenUsage.output}`);
-
         if (isStreaming) {
           await writeStreamedResponse(res, finalText, rawModel, tokenUsage);
         } else {
@@ -513,16 +506,13 @@ const server = http.createServer(async (req, res) => {
 
 // ─── Start ──────────────────────────────────────────────────────────────────
 server.listen(CONFIG.port, CONFIG.bindHost, () => {
-  log('info', `Proxy v3.1 running on http://${CONFIG.bindHost}:${CONFIG.port}`);
+  log('info', `Proxy v4.0 running on http://${CONFIG.bindHost}:${CONFIG.port}`);
   log('info', `SDK: ${CONFIG.sdkUrl} | Timeout: ${CONFIG.requestTimeoutMs}ms`);
   log('info', `Auto-approve: ${CONFIG.autoApprovePermissions} | Reasoning: ${CONFIG.reasoningFormat}`);
-  if (CONFIG.autoApprovePermissions || CONFIG.autoAnswerQuestions) startPermissionPoller();
 });
 
-// ─── Shutdown ───────────────────────────────────────────────────────────────
 function shutdown(sig) {
   log('info', `${sig} received, shutting down...`);
-  stopPermissionPoller();
   server.close(() => { log('info', 'Closed'); process.exit(0); });
   setTimeout(() => process.exit(1), 5000);
 }

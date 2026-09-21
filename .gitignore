@@ -45,3 +45,7 @@ coverage/
 *.session
 *.db
 *.sqlite
+
+# Local secrets (never commit)
+.opencode-password
+.openclaw/
